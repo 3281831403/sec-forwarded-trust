@@ -2,6 +2,7 @@
 
 import ipaddress
 from collections.abc import Mapping
+from functools import lru_cache
 
 DEFAULT_MAX_HOPS = 3
 _XFF = "x-forwarded-for"
@@ -24,8 +25,12 @@ def _as_values(value):
         return []
     if isinstance(value, str):
         return [value]
-    if isinstance(value, (list, tuple, set)):
+    if isinstance(value, (list, tuple)):
         return list(value)
+    if isinstance(value, set):
+        # Sort so repeated-header merging is deterministic regardless of
+        # interpreter hash randomization.
+        return sorted(value, key=str)
     return [value]
 
 
@@ -64,12 +69,10 @@ def _request_limit(request):
     return DEFAULT_MAX_HOPS
 
 
-def _is_ip(value):
-    try:
-        ipaddress.ip_address(str(value).strip())
-    except ValueError:
-        return False
-    return True
+@lru_cache(maxsize=128)
+def _parse_network(text):
+    # strict=False accepts bare host addresses (e.g. "10.0.0.2" -> /32).
+    return ipaddress.ip_network(text, strict=False)
 
 
 def parse_chain(value):
@@ -80,39 +83,64 @@ def parse_chain(value):
         raw = ",".join(str(item) for item in value)
     else:
         raw = str(value)
-    return [part for part in raw.split(",") if part]
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
 
 def trusted(addr, nets):
-    """Return whether addr belongs to one of the configured networks."""
+    """Return whether addr belongs to one of the configured networks.
+
+    Matching is done on real IP/network semantics rather than string
+    prefixes, and anything that cannot be parsed as an address is treated
+    as untrusted.
+    """
     text = str(addr).strip()
     if not text:
         return False
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return False
     for net in nets or []:
-        base = str(net).split("/", 1)[0].strip()
-        if not base:
+        net_text = str(net).strip()
+        if not net_text:
             continue
-        if "." in base:
-            prefix = base.rsplit(".", 1)[0]
-        else:
-            prefix = base
-        if text.startswith(prefix):
+        try:
+            network = _parse_network(net_text)
+        except ValueError:
+            continue
+        if ip in network:
             return True
     return False
 
 
 def client_ip(chain, peer, nets):
-    """Resolve the client address for a request received from peer."""
-    hops = list(chain or [])
+    """Resolve the client address for a request received from peer.
+
+    Headers are only honoured when the direct TCP peer is a trusted proxy.
+    The chain is then walked right-to-left, skipping trusted proxy hops,
+    and the leftmost untrusted address is the client. A forged header
+    arriving from an untrusted peer can never override the peer address.
+    """
+    hops = [str(hop).strip() for hop in (chain or []) if str(hop).strip()]
     if not hops:
         return peer
-    if trusted(peer, nets):
-        return hops[-1]
-    return hops[0]
+    if not trusted(peer, nets):
+        return peer
+    for hop in reversed(hops):
+        if not trusted(hop, nets):
+            return hop
+    # Every hop claims to be a trusted proxy; fall back to the peer.
+    return peer
 
 
-def proto_of(value, trusted):
-    """Return the protocol selected for a forwarded request."""
+def proto_of(value, trusted_source):
+    """Return the protocol selected for a forwarded request.
+
+    The forwarded-proto header is only accepted when it originates from a
+    trusted source; anything else falls back to plain http.
+    """
+    if not trusted_source:
+        return "http"
     text = "" if value is None else str(value).strip().lower()
     if text in ("http", "https"):
         return text
@@ -124,15 +152,15 @@ def merge_headers(headers):
     values = _header_values(headers, _XFF)
     if not values:
         return []
-    return parse_chain(values[0])
+    return parse_chain(values)
 
 
 def check_limit(chain, policy):
-    """Apply the configured hop limit to chain."""
+    """Apply the configured hop limit to chain by truncating excess hops."""
     hops = list(chain or [])
     limit = _limit_from_policy(policy)
     if len(hops) > limit:
-        return []
+        return hops[:limit]
     return hops
 
 
@@ -145,7 +173,8 @@ def validate_request(request, nets):
 
     forwarded_values = _header_values(headers, _XFF)
     chain = merge_headers(headers)
-    if forwarded_values and not trusted(peer, nets):
+    peer_trusted = trusted(peer, nets)
+    if forwarded_values and not peer_trusted:
         issues.append("untrusted_forwarded")
 
     limit = _request_limit(req)
@@ -153,9 +182,11 @@ def validate_request(request, nets):
         issues.append("chain_too_long")
 
     proto_values = _header_values(headers, _XFP)
-    if proto_values and not trusted(peer, nets):
+    if proto_values and not peer_trusted:
         issues.append("untrusted_proto")
 
+    # Host whitelisting is independent of the forwarded-source decision:
+    # it runs on its own input regardless of whether the peer is trusted.
     allowed = req.get("allowed_hosts")
     if allowed is not None:
         host = str(req.get("host", "")).strip().lower()
@@ -167,15 +198,17 @@ def validate_request(request, nets):
 
 
 def forwarded_batch(requests, nets):
-    """Resolve the client address for each request in a batch."""
+    """Resolve the client address for each request in a batch.
+
+    Each request is resolved independently: headers and chains are never
+    shared across entries.
+    """
     results = {}
-    cached_chain = None
     for index, request in enumerate(requests or []):
         req = request or {}
         headers = req.get("headers") or {}
-        if cached_chain is None:
-            cached_chain = merge_headers(headers)
+        chain = merge_headers(headers)
         peer = req.get("peer", "")
         key = str(req.get("id", index))
-        results[key] = client_ip(cached_chain, peer, nets)
+        results[key] = client_ip(chain, peer, nets)
     return results
